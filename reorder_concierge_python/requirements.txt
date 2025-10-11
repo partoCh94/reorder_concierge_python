@@ -1,0 +1,7 @@
+fastapi
+openai
+gspread
+google-auth
+pandas
+openpyxl
+langgraph>=0.2.0
