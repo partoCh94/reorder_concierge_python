@@ -1,34 +1,53 @@
+# reorder_concierge_graph.py
 """
-Automated Re-Order Concierge (Excel + LangGraph + HITL)
-Safe local test version:
-- uses Path resolution to avoid invalid escape sequences
-- verifies Excel exists before reading
-- default sends via local SMTP DebuggingServer (localhost:1025) for testing
-- optional Gmail mode (uses env vars GMAIL_ADDRESS and GMAIL_APP_PASSWORD)
+Automated Re-Order Concierge (Google Sheets + LangGraph + HITL + Logging)
+Runs once at start, then repeats every 24 hours.
 """
 
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
-from excel_reader import read_inventory_from_excel
 from datetime import datetime, timedelta
 from pathlib import Path
-import pandas as pd
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
 import smtplib
 import os
-import sys
+import time
 
+# Google Sheets
+import gspread
+from google.oauth2.service_account import Credentials
+REORDER_SMTP_MODE="gmail"
+GMAIL_ADDRESS="charkhkaar@gmail.com"
+GMAIL_APP_PASSWORD="gouxrtvkgarmpazr"
+REORDER_OWNER_EMAIL="charkhkaar@gmail.com"
+REORDER_EXCEL_PATH="inventory_status.xlsx"
+REORDER_SERVICE_ACCOUNT_FILE="D:/bootcamp/5/reorder_concierge_python/langgraph/service_account.json"
+SPREADSHEET_ID="1bgubGBfhFDOTSOqF8y8HfprGbAEpsn26wRl_3m56M9E"
 # ----------------------------
-# Config: change these if needed
-# By default we use local debug SMTP server at localhost:1025
+# Load .env file automatically
+load_dotenv()
+print(os.getenv("GMAIL_ADDRESS"))
+print(os.getenv("SPREADSHEET_ID"))
+# ----------------------------
+# Config (from environment variables)
 SMTP_MODE = os.getenv("REORDER_SMTP_MODE", "local")  # "local" or "gmail"
 LOCAL_SMTP_HOST = os.getenv("REORDER_LOCAL_SMTP_HOST", "localhost")
 LOCAL_SMTP_PORT = int(os.getenv("REORDER_LOCAL_SMTP_PORT", "1025"))
-# For Gmail mode, set env vars: GMAIL_ADDRESS and GMAIL_APP_PASSWORD
+GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+REORDER_OWNER_EMAIL = os.getenv("REORDER_OWNER_EMAIL", "owner@example.com")
+
+# Google Sheets config
+SERVICE_ACCOUNT_FILE = os.getenv(
+    "REORDER_SERVICE_ACCOUNT_FILE",
+    r"reorder_concierge_python/langgraph/service_account.json"
+)
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")  # must be set in .env
 
 # ----------------------------
-# Define the workflow state
+# Define workflow state
 class InventoryState(TypedDict):
     item: str
     qty: int
@@ -36,7 +55,6 @@ class InventoryState(TypedDict):
     supplier: str
     email: str
     last_checked: str
-    approved: bool | None
 
 # ----------------------------
 # State functions
@@ -51,15 +69,14 @@ def check_inventory(state: InventoryState) -> InventoryState:
 def request_approval(state: InventoryState) -> InventoryState:
     if state["qty"] < state["threshold"]:
         print(f"📨 Requesting approval from {state['email']} (simulation)...")
-        state["approved"] = True
     return state
 
 def create_purchase_order(state: InventoryState) -> InventoryState:
-    if state.get("approved"):
+    if state["qty"] < state["threshold"]:
         print(f"🧾 Auto-order created for {state['supplier']} ({state['item']} × {state['threshold'] * 2})")
         state["last_checked"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     else:
-        print("❌ Approval not received. Order not created.")
+        print("❌ Stock sufficient. No order created.")
     return state
 
 def build_graph():
@@ -74,68 +91,115 @@ def build_graph():
     return workflow.compile()
 
 # ----------------------------
-# HITL email generation (only items with on_hand_qty < reorder_threshold AND last_checked > 24h)
-def generate_reorder_emails(file_path: Path):
-    """
-    Generate draft emails for order approval (HITL stage)
-    Only items that:
-    1) on_hand_qty < reorder_threshold
-    2) last_checked > 24 hours ago (or last_checked empty/invalid)
-    will be processed.
-    """
-    df = pd.read_excel(file_path)
+# Google Sheets helpers
+def init_sheets_client():
+    if not SPREADSHEET_ID:
+        raise RuntimeError("SPREADSHEET_ID not set in environment (.env)")
+    sa_path = Path(SERVICE_ACCOUNT_FILE)
+    if not sa_path.exists():
+        raise RuntimeError(f"Service account file not found: {sa_path}")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_file(str(sa_path), scopes=scopes)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(SPREADSHEET_ID)
+    return sheet
 
-    # Filter items below reorder threshold
-    reorder_items = df[df["on_hand_qty"] < df["reorder_threshold"]]
+def update_google_sheet_last_checked(sheet, sent_supplier_emails, now_str):
+    try:
+        ws = sheet.sheet1
+        records = ws.get_all_records()
+        header = ws.row_values(1)
+        def col_index(col_name):
+            try:
+                return header.index(col_name) + 1
+            except ValueError:
+                return None
 
-    # Filter items last checked more than 24 hours ago
-    now = datetime.now()
-    def is_due(row):
+        idx_supplier = col_index("supplier_email")
+        idx_onhand = col_index("on_hand_qty")
+        idx_threshold = col_index("reorder_threshold")
+        idx_last_checked = col_index("last_checked")
+
+        if None in (idx_supplier, idx_onhand, idx_threshold, idx_last_checked):
+            print("⚠️ Missing required columns; cannot update last_checked.")
+            return
+
+        for i, row in enumerate(records, start=2):
+            supplier_email = row.get("supplier_email", "").strip()
+            try:
+                on_hand = int(row.get("on_hand_qty") or 0)
+                threshold = int(row.get("reorder_threshold") or 0)
+            except Exception:
+                on_hand = 0
+                threshold = 0
+
+            if supplier_email in sent_supplier_emails and on_hand < threshold:
+                ws.update_cell(i, idx_last_checked, now_str)
+
         try:
-            last_checked = pd.to_datetime(row["last_checked"])
-            return (now - last_checked) > timedelta(hours=24)
-        except Exception:
-            return True  # if empty/invalid, treat as due
+            log_ws = sheet.worksheet("Log")
+        except gspread.exceptions.WorksheetNotFound:
+            log_ws = sheet.add_worksheet(title="Log", rows=1000, cols=10)
+            log_ws.append_row(["timestamp", "action", "details"])
+        log_ws.append_row([now_str, "Emails sent", ", ".join(sent_supplier_emails)])
+        print("✅ Google Sheet updated (last_checked + Log).")
+    except Exception as e:
+        print(f"❌ Failed to update Google Sheet: {e}")
 
-    reorder_items = reorder_items[reorder_items.apply(is_due, axis=1)]
-
-    if reorder_items.empty:
-        print("✅ No items require reordering (after 24h filter).")
+# ----------------------------
+# Generate emails from Google Sheet
+def generate_reorder_emails_from_sheet(sheet_client, sheet_name="Sheet1"):
+    try:
+        worksheet = sheet_client.worksheet(sheet_name)
+        records = worksheet.get_all_records()
+        print(f"📧 Loaded {len(records)} records from Google Sheet for email generation.")
+    except Exception as e:
+        print(f"⚠️ Cannot read Google Sheet for emails: {e}")
         return []
 
-    # Group by supplier
-    grouped = reorder_items.groupby(["supplier_name", "supplier_email"])
     emails = []
+    for row in records:
+        if not row.get("supplier_email") or not row.get("item_name"):
+            continue
 
-    for (supplier_name, supplier_email), group in grouped:
-        items_text = "\n".join([
-            f"- {row['item_name']} (SKU: {row['item_sku']}) → On-hand: {row['on_hand_qty']}, Threshold: {row['reorder_threshold']}, Suggested order: {row['order_qty']}"
-            for _, row in group.iterrows()
-        ])
+        qty = int(row.get("on_hand_qty", 0))
+        threshold = int(row.get("reorder_threshold", 0))
+        if qty >= threshold:
+            continue
 
-        body = f"""Hello {supplier_name},
+        supplier = row.get("supplier_name")
+        email = row.get("supplier_email")
+        item = row.get("item_name")
+        order_qty = row.get("order_qty", threshold * 2)
 
-Please review and approve the following items:
+        subject = f"📦 Order Approval Required ({item})"
+        body = f"""سلام {supplier} عزیز،
 
-{items_text}
+موجودی کالای "{item}" در انبار کمتر از حد آستانه ({threshold}) شده است.
+لطفاً سفارش زیر را بررسی و تأیید نمایید:
 
-Best regards,
-Automated Reorder Team
+کالا: {item}
+تعداد سفارش پیشنهادی: {order_qty}
+موجودی فعلی: {qty}
+
+با احترام،
+تیم سفارش خودکار
 """
+        emails.append({
+            "to": email,
+            "subject": subject,
+            "body": body,
+        })
 
-        msg = MIMEMultipart()
-        msg['To'] = supplier_email
-        # include owner in subject so it's clear (we'll cc owner when sending)
-        msg['Subject'] = f"📦 Order Approval Required ({supplier_name})"
-        # store owner email in a header for later (if available in df we can pick first owner)
-        emails.append({"msg": msg, "supplier_name": supplier_name, "supplier_email": supplier_email, "body": body})
-
-    print(f"📧 {len(emails)} draft email groups generated (HITL).")
+    print(f"📨 {len(emails)} reorder emails generated.")
     return emails
 
 # ----------------------------
-# HITL confirmation and send (supports local debug SMTP and Gmail)
-def hitl_confirm_and_send(email_groups, excel_path: Path):
+# HITL email send
+GMAIL_ADDRESS="charkhkaar@gmail.com"
+GMAIL_APP_PASSWORD="gouxrtvkgarmpazr"
+REORDER_OWNER_EMAIL="charkhkaar@gmail.com"
+def hitl_confirm_and_send(email_groups, sheet_client=None):
     if not email_groups:
         print("⚠️ No emails to process.")
         return
@@ -145,103 +209,121 @@ def hitl_confirm_and_send(email_groups, excel_path: Path):
         print("❌ Orders rejected by owner.")
         return
 
-    # For sending, determine mode
     if SMTP_MODE == "gmail":
-        sender_email = os.getenv("GMAIL_ADDRESS")
-        app_password = os.getenv("GMAIL_APP_PASSWORD")
-        if not sender_email or not app_password:
-            print("❌ Gmail credentials not set in environment variables (GMAIL_ADDRESS / GMAIL_APP_PASSWORD).")
-            return
-        use_ssl = True
         smtp_host = "smtp.gmail.com"
         smtp_port = 465
+        sender_email = GMAIL_ADDRESS
+        use_ssl = True
     else:
-        # local debug server
-        sender_email = os.getenv("REORDER_OWNER_EMAIL", "owner@example.com")
-        app_password = None
         smtp_host = LOCAL_SMTP_HOST
         smtp_port = LOCAL_SMTP_PORT
-        use_ssl = False  # DebuggingServer uses plain SMTP
+        sender_email = REORDER_OWNER_EMAIL
+        use_ssl = False
+
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+                server.login(sender_email, GMAIL_APP_PASSWORD)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                pass
+        print("✅ SMTP connection successful!")
+    except Exception as e:
+        print(f"❌ Failed to connect to SMTP server: {e}")
+        return
 
     sent_to = []
     for group in email_groups:
-        supplier_email = group["supplier_email"]
-        supplier_name = group["supplier_name"]
-        body = group["body"]
-        subject = f"📦 Order Approval Required ({supplier_name})"
-
-        # prepare MIME
         msg = MIMEMultipart()
         msg['From'] = sender_email
-        msg['To'] = supplier_email
-        msg['Subject'] = subject
-        # CC owner if provided via env (optional)
-        owner_email = os.getenv("REORDER_OWNER_EMAIL")
-        if owner_email:
-            msg['Cc'] = owner_email
-        msg.attach(MIMEText(body, "plain"))
+        msg['To'] = group["to"]
+        msg['Subject'] = group["subject"]
+        if REORDER_OWNER_EMAIL:
+            msg['Cc'] = REORDER_OWNER_EMAIL
+        msg.attach(MIMEText(group["body"], "plain"))
 
         try:
-            if SMTP_MODE == "gmail":
+            if use_ssl:
                 with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
-                    server.login(sender_email, app_password)
+                    server.login(sender_email, GMAIL_APP_PASSWORD)
                     server.send_message(msg)
             else:
-                # local debug server (no auth)
                 with smtplib.SMTP(smtp_host, smtp_port) as server:
                     server.send_message(msg)
-            print(f"✅ (simulated) Order sent to {supplier_email}")
-            sent_to.append(supplier_email)
+            print(f"✅ Email sent to {group['to']}")
+            sent_to.append(group['to'])
         except Exception as e:
-            print(f"❌ Failed to send email to {supplier_email}: {e}")
+            print(f"❌ Failed to send email to {group['to']}: {e}")
 
-    # Update last_checked in Excel for rows that were sent
-    if sent_to:
-        df = pd.read_excel(excel_path)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        for supplier_email in sent_to:
-            mask = (df["supplier_email"] == supplier_email) & (df["on_hand_qty"] < df["reorder_threshold"])
-            df.loc[mask, "last_checked"] = now
-        df.to_excel(excel_path, index=False)
-        print("✅ Excel file updated with new last_checked timestamps.")
-    else:
-        print("⚠️ No successful sends; Excel not updated.")
+    # Update last_checked + log
+    if sheet_client and sent_to:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        update_google_sheet_last_checked(sheet_client, sent_to, now_str)
 
 # ----------------------------
-# Helper: resolve file path safely
-def resolve_path(path_str: str) -> Path:
-    p = Path(path_str)
-    if not p.is_absolute():
-        # resolve relative to script directory
-        p = (Path(__file__).parent / p).resolve()
-    return p
-
-# ----------------------------
-# Main
-if __name__ == "__main__":
-    # Put your excel filename here (relative to this script) or absolute path
-    FILE_PATH_STR = os.getenv("REORDER_EXCEL_PATH", "inventory_status_farsi.xlsx")
-    FILE_PATH = resolve_path(FILE_PATH_STR)
-
-    # quick sanity checks
-    if not FILE_PATH.exists():
-        print(f"❌ Excel file not found: {FILE_PATH}")
-        print("Make sure the file exists and path is correct (use absolute path or place file next to this script).")
-        sys.exit(1)
-
-    print("📥 Reading inventory from Excel...")
-    # use your excel_reader (it should return records for the graph)
-    records = read_inventory_from_excel(str(FILE_PATH))
+# Core run function
+def run_once():
+    print("📥 Reading inventory from Google Sheet...")
+    try:
+        sheet_client = init_sheets_client()
+        worksheet = sheet_client.worksheet("Sheet1")
+        records = worksheet.get_all_records()
+        print(f"✅ {len(records)} records loaded from Google Sheet.")
+    except Exception as e:
+        print(f"⚠️ Google Sheets unavailable: {e}")
+        return
 
     graph = build_graph()
-    for record in records:
+
+    # Map fields and invoke graph
+    for idx, record in enumerate(records, start=2):
         print("\n===============================")
-        final_state = graph.invoke(record)
+        mapped_record = {
+            "item": record.get("item_name"),
+            "qty": record.get("on_hand_qty"),
+            "threshold": record.get("reorder_threshold"),
+            "supplier": record.get("supplier_name"),
+            "email": record.get("supplier_email"),
+            "last_checked": record.get("last_checked"),
+        }
+        final_state = graph.invoke(mapped_record)
         print("🏁 Final state:", final_state)
 
-    print("\n===============================")
-    print("✉️ Generating HITL draft emails...")
-    emails = generate_reorder_emails(FILE_PATH)
+        update_mapping = {
+            "item": "item_name",
+            "qty": "on_hand_qty",
+            "threshold": "reorder_threshold",
+            "supplier": "supplier_name",
+            "email": "supplier_email",
+            "last_checked": "last_checked",
+        }
 
-    # HITL confirmation & sending (local debug by default)
-    hitl_confirm_and_send(emails, FILE_PATH)
+        for col_name, value in final_state.items():
+            sheet_col = update_mapping.get(col_name)
+            if not sheet_col:
+                continue
+            try:
+                cell = worksheet.find(sheet_col)
+                if cell:
+                    worksheet.update_cell(idx, cell.col, value)
+            except Exception as e:
+                print(f"⚠️ Cannot update column '{sheet_col}': {e}")
+
+    # Generate emails and send
+    print("\n===============================")
+    print("✉️ Generating HITL draft emails from Google Sheet...")
+    emails = generate_reorder_emails_from_sheet(sheet_client, "Sheet1")
+    hitl_confirm_and_send(emails, sheet_client=sheet_client)
+    print("✅ Google Sheet updated and emails processed successfully.")
+
+# ----------------------------
+# Scheduler
+if __name__ == "__main__":
+    try:
+        while True:
+            print(f"\n=== Run started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+            run_once()
+            print("✅ Run complete. Sleeping 24 hours...")
+            time.sleep(86400)
+    except KeyboardInterrupt:
+        print("\n🛑 Exiting on user interrupt.")
